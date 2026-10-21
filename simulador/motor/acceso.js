@@ -9,6 +9,8 @@
 //      (`acceso_semanal.py activar|desactivar|revocar` → `Activar_acceso_curso.bat`).
 //      control.json = {d: base64url(JSON {v: 2, t: emitido, c: {clave: {n, p, e}}, r: [i revocados]}), s: firma}
 //      r = códigos personales anulados antes de su vencimiento (por su campo i).
+//      (14/10/2026) x = códigos personales AMPLIADOS {"<i>": {e: nuevo vence, p: [puertas extra]}} · z = códigos EN PAUSA [i] ·
+//      c[clave].z = 1 → curso EN PAUSA. Campos opcionales: un control.json sin ellos funciona igual que antes.
 // Puertas: '*' (todo), 'cafeteria', 'biblioteca', '<area>' (todo el edificio) o '<area>/<modulo>' (una puerta).
 // Modos: 'propietario' (archivo local o localhost: todo abierto; ?probar_acceso fuerza la revisión),
 //        'aula' (red local del servidor de aula: todo abierto), 'publico' (internet: se exige código o curso activo).
@@ -18,7 +20,8 @@
 const LLAVE_PUBLICA = {"kty":"EC","crv":"P-256","x":"5PRytfcMjnoGTScsqc1MI8jtZM5ab6opAZrnh3Chfyo","y":"5P9ntPXikb96EFdSTipp4xV0QZ6ZcQJKKYP_GV-5QAI"};   // la escribe acceso_semanal.py llaves
 const WHATSAPP = '522411794542';   // +52 241 179 4542 (Carlos Eduardo Roa Sánchez · CERS)
 const SIEMPRE = ['informacion', 'cafeteria', 'biblioteca'];   // gratis para todos, siempre (decisión del propietario 04/10/2026)
-const CONTROL_PUBLICO = 'https://lalot127-coder.github.io/campus-sst/acceso/control.json';
+// las dos plataformas publican el mismo control.json; si una no responde (p. ej. una red que bloquea github.io) se usa la otra
+const CONTROLES_PUBLICOS = ['https://campus-sst.pages.dev/acceso/control.json', 'https://lalot127-coder.github.io/campus-sst/acceso/control.json'];
 const BASE_ACC = document.currentScript ? document.currentScript.src : location.href;
 const K = 'campus_acceso', KC = 'campus_cursos';
 const b64 = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), c => c.charCodeAt(0)); };
@@ -52,7 +55,7 @@ async function verificar(cod) {
 // repositorios de github.io, en el campus principal.
 async function leerControl() {
   const urls = [new URL('../acceso/control.json', BASE_ACC).href];
-  if (location.hostname.endsWith('github.io') && urls[0] !== CONTROL_PUBLICO) urls.push(CONTROL_PUBLICO);
+  if (modo() === 'publico') CONTROLES_PUBLICOS.forEach(u => { if (!urls.includes(u)) urls.push(u); });
   for (const u of urls) {
     try {
       const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 5000);
@@ -76,15 +79,24 @@ const listo = (async () => {
   if (P.has('acceso') || P.has('curso')) { const u = new URL(location.href); u.searchParams.delete('acceso'); u.searchParams.delete('curso'); history.replaceState(null, '', u.pathname + u.search + u.hash); }
   const ctl = (estado.modo === 'publico' || claves.length || cod) ? await leerControl() : null;
   estado.control = !!ctl;
-  if (cod) { const r = await verificar(cod); if (r.datos) { estado.nombre = r.datos.n || ''; estado.puertas = r.datos.p || []; estado.vence = new Date(r.datos.e * 1000); estado.emitido = r.datos.i; }
+  if (cod) { const r = await verificar(cod);
+    if (r.datos) { // la firma ya se comprobó: aplica AMPLIACIONES del propietario (control.x) aunque el código haya vencido
+      const d = r.datos, amp = ctl && ctl.x && ctl.x[String(d.i)];
+      let e = d.e, p = d.p || [];
+      if (amp) { if (amp.e) e = amp.e; if (amp.p) p = Array.from(new Set(p.concat(amp.p))); }
+      estado.nombre = d.n || ''; estado.puertas = p; estado.vence = new Date(e * 1000); estado.emitido = d.i;
+      if (amp && amp.e) { const vig = Date.now() / 1000 <= e; r.valido = vig; r.motivo = vig ? '' : 'Tu código de acceso venció.'; } }
     estado.valido = !!r.valido; estado.motivo = r.motivo || '';
-    if (estado.valido && ctl && (ctl.r || []).includes(r.datos.i)) { estado.valido = false; estado.motivo = 'Tu código de acceso fue desactivado por el propietario.'; } }
+    if (estado.valido && ctl && (ctl.r || []).includes(r.datos.i)) { estado.valido = false; estado.motivo = 'Tu código de acceso fue desactivado por el propietario.'; }
+    else if (estado.valido && ctl && (ctl.z || []).includes(r.datos.i)) { estado.valido = false; estado.motivo = 'Tu código de acceso está en pausa. Pide a la persona instructora que lo reactive.'; } }
   else estado.motivo = 'Aún no tienes código de acceso.';
   const ahora = Date.now() / 1000;
-  estado.cursos = claves.map(c => { const k = ctl && ctl.c && ctl.c[c]; return { clave: c, n: (k && k.n) || c, activo: !!(k && k.e > ahora), p: (k && k.p) || [], vence: k ? new Date(k.e * 1000) : null }; });
+  estado.cursos = claves.map(c => { const k = ctl && ctl.c && ctl.c[c]; return { clave: c, n: (k && k.n) || c, activo: !!(k && !k.z && k.e > ahora), pausa: !!(k && k.z), p: (k && k.p) || [], vence: k ? new Date(k.e * 1000) : null }; });
   const act = estado.cursos.filter(c => c.activo);
   if (!estado.valido && act.length) estado.motivo = '';
-  else if (!estado.valido && estado.cursos.length) estado.motivo = `El acceso del curso «${estado.cursos[0].n}» no está activo en este momento. Pide a la persona instructora que lo active.`;
+  else if (!estado.valido && estado.cursos.length) estado.motivo = estado.cursos[0].pausa
+    ? `El acceso del curso «${estado.cursos[0].n}» está en pausa. Pide a la persona instructora que lo reactive.`
+    : `El acceso del curso «${estado.cursos[0].n}» no está activo en este momento. Pide a la persona instructora que lo active.`;
   return estado;
 })();
 const cubre = (lista, id) => { const area = String(id).split('/')[0]; return lista.some(p => p === '*' || p === id || p === area || p === area + '/*'); };
